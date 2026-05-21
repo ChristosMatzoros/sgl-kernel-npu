@@ -11,7 +11,9 @@
 namespace NsCausalConv1dCommon {
 
 constexpr int32_t MAX_WIDTH = 4;
-constexpr int32_t MAX_BLOCK_DIM = 4096;
+// PR-2: reduced from 4096 to 2048. UB budget at dt=2048: inBuf 20KB + outBuf 8KB
+// + calcBuf 48KB + castedRingBuf 40KB = 116KB (of 192KB). dt=4096 would overflow.
+constexpr int32_t MAX_BLOCK_DIM = 2048;
 constexpr int32_t RING_SLOTS = 5;
 
 __aicore__ inline int32_t SlotCurr(int32_t t)

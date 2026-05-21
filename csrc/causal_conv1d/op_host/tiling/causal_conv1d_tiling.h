@@ -23,7 +23,12 @@ struct DimTileChoice {
 
 inline DimTileChoice ChooseDimTileSize(int64_t batch, int64_t dim, int32_t core_num)
 {
-    constexpr std::array<int64_t, 6> kCandidates = {4096, 2048, 1024, 512, 384, 192};
+    // PR-5: 4096 dropped — UB budget caps dt at 2048 (MAX_BLOCK_DIM was
+    // lowered to fit the PR-2 castedRingBuf). For dim=4096 batch=2 typical
+    // shape this still picks 512 (grid=16, 16 of 40 cores busy). Going
+    // finer (dt=128, grid=64) needs per-task PipeBarrier<PIPE_ALL> for
+    // cross-task correctness and that ate the parallelism gain.
+    constexpr std::array<int64_t, 5> kCandidates = {2048, 1024, 512, 384, 192};
     DimTileChoice best_over;
     int64_t best_over_gap = std::numeric_limits<int64_t>::max();
     DimTileChoice best_under;
