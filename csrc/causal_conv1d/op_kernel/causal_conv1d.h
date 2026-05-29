@@ -307,13 +307,20 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
         const int32_t slotPref = (t + 1 < len) ? SlotPrefetch(t) : -1;   // slot to prefetch into; -1 = no prefetch on the last iter
         const int32_t outSlot  = t & 1;                                  // alternates 0/1 across iters → outBuf double-buffer
 
+        // P2.B: wait for prev iter's MTE2 prefetch of slotCurr (RAW). Iter 0 has
+        // no prior set — InitRing's PIPE_ALL drains MTE2 before RunSeq starts.
+        if (t > 0) {
+            WaitFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_);
+        }
+
         // ── Prefetch next input token while we compute this one ──────────
         if (t + 1 < len) {
             // Load xGm[start + t + 1] into the slot RunSeq will consume at iter t+1.
             const int64_t xOffset = static_cast<int64_t>(start + t + 1) * dim + c0; // GM byte offset of next token, this dim block
             PipeBarrier<PIPE_ALL>();                                      // fence prior iter's V Cast that read this slot (loop-carried WAR on `ring`) — P2.C target
             DataCopy(ring[slotPref * MAX_BLOCK_DIM], xGm[xOffset], dimTileSize); // MTE2: GM → UB slot[slotPref]
-            // P2.A: dropped post-prefetch PIPE_ALL — L328 (next iter's tap-loop barrier) already covers MTE2→V sync.
+            // P2.B: signal MTE2 prefetch complete — next iter's WaitFlag<MTE2_V> pops this.
+            SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_);
         }
 
         // ── Init accumulator to bias ─────────────────────────────────────
@@ -322,14 +329,14 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
 
         // ── Width-4 multiply-add: accF += weightF[j] * cast(ring[tap]) for each tap ──
         // Tap order is reversed (j=0 → oldest tap = (t-3), j=W-1 → current token = t).
+        // P2.B: dropped per-tap PIPE_ALL (L328) — single WaitFlag<MTE2_V> at iter entry
+        // covers MTE2→V sync for slotCurr; history slots (taps 1..3) were prefetched
+        // many iters ago, drained by L314's PIPE_ALL or by InitRing for the first 4 iters.
         for (int32_t j = 0; j < MAX_WIDTH; ++j) {
             const int32_t tap  = (MAX_WIDTH - 1) - j;                    // tap index counting back from t (3,2,1,0)
             const int32_t slot = (tap == 0) ? slotCurr : SlotHist(t, tap); // which ring slot this tap lives in
-            PipeBarrier<PIPE_ALL>();                                      // gate so V Cast sees the most recent ring write (MTE2 from prefetch or InitRing) — P2.B target
             Cast(tmpF, ring[slot * MAX_BLOCK_DIM], RoundMode::CAST_NONE, dimTileSize); // V: T → FP32 into tmpF
-            // P2.A: dropped 2× post-Cast PIPE_ALL — Cast/MulAddDst are both V-pipe ops, FIFO-ordered.
             MulAddDst(accF, tmpF, weightF[j * MAX_BLOCK_DIM], dimTileSize);          // V: accF += tmpF * weightF[j]  (in-place accumulate)
-            // P2.A: dropped post-MulAddDst PIPE_ALL — next iter's L328 (or Silu/pack below) handles any cross-pipe sync.
         }
 
         // Optional SiLU activation: tmpF = silu(accF). Separate dst tensor —
