@@ -311,9 +311,9 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
         if (t + 1 < len) {
             // Load xGm[start + t + 1] into the slot RunSeq will consume at iter t+1.
             const int64_t xOffset = static_cast<int64_t>(start + t + 1) * dim + c0; // GM byte offset of next token, this dim block
-            PipeBarrier<PIPE_ALL>();                                      // fence prior iter's V Cast that read this slot (loop-carried WAR on `ring`)
+            PipeBarrier<PIPE_ALL>();                                      // fence prior iter's V Cast that read this slot (loop-carried WAR on `ring`) — P2.C target
             DataCopy(ring[slotPref * MAX_BLOCK_DIM], xGm[xOffset], dimTileSize); // MTE2: GM → UB slot[slotPref]
-            PipeBarrier<PIPE_ALL>();                                      // (analyzer flags as redundant — the next loop iter's barriers cover this)
+            // P2.A: dropped post-prefetch PIPE_ALL — L328 (next iter's tap-loop barrier) already covers MTE2→V sync.
         }
 
         // ── Init accumulator to bias ─────────────────────────────────────
@@ -325,12 +325,11 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
         for (int32_t j = 0; j < MAX_WIDTH; ++j) {
             const int32_t tap  = (MAX_WIDTH - 1) - j;                    // tap index counting back from t (3,2,1,0)
             const int32_t slot = (tap == 0) ? slotCurr : SlotHist(t, tap); // which ring slot this tap lives in
-            PipeBarrier<PIPE_ALL>();                                      // gate so V Cast sees the most recent ring write (MTE2 from prefetch or InitRing)
+            PipeBarrier<PIPE_ALL>();                                      // gate so V Cast sees the most recent ring write (MTE2 from prefetch or InitRing) — P2.B target
             Cast(tmpF, ring[slot * MAX_BLOCK_DIM], RoundMode::CAST_NONE, dimTileSize); // V: T → FP32 into tmpF
-            PipeBarrier<PIPE_ALL>();                                      // (analyzer flags as redundant; same-pipe V→V is FIFO-ordered)
-            PipeBarrier<PIPE_ALL>();                                      // (analyzer flags as redundant — double-barrier, pure waste)
+            // P2.A: dropped 2× post-Cast PIPE_ALL — Cast/MulAddDst are both V-pipe ops, FIFO-ordered.
             MulAddDst(accF, tmpF, weightF[j * MAX_BLOCK_DIM], dimTileSize);          // V: accF += tmpF * weightF[j]  (in-place accumulate)
-            PipeBarrier<PIPE_ALL>();                                      // (analyzer flags as redundant; V→V same pipe)
+            // P2.A: dropped post-MulAddDst PIPE_ALL — next iter's L328 (or Silu/pack below) handles any cross-pipe sync.
         }
 
         // Optional SiLU activation: tmpF = silu(accF). Separate dst tensor —
@@ -341,7 +340,7 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
 
         // ── Pack result into outT (slot 0 or 1 depending on outSlot) ─────
         // FP32 path keeps DataCopy (intra-UB on V); narrower dtypes need a Cast back from FP32.
-        PipeBarrier<PIPE_ALL>();                                          // gate before next op so V sees the Silu/MulAddDst result
+        // P2.A: dropped pre-pack PIPE_ALL — Silu/MulAddDst/DataCopy/Cast are all V-pipe ops, FIFO-ordered.
         if constexpr (IsSameType<T, float>::value) {
             // T == float: result is already FP32, just move it into the outT slot.
             if (hasActivation) {
@@ -357,13 +356,13 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
                 Cast(outT[outSlot * MAX_BLOCK_DIM], accF, RoundMode::CAST_RINT, dimTileSize); // V: outT[outSlot] ← (T)accF
             }
         }
-        PipeBarrier<PIPE_ALL>();                                          // gate so MTE3 below sees the outT write V just made (cross-pipe V→MTE3 RAW)
+        PipeBarrier<PIPE_ALL>();                                          // gate so MTE3 below sees the outT write V just made (cross-pipe V→MTE3 RAW) — Phase 3 target
 
         // ── Store this token's output to yGm ─────────────────────────────
         const int64_t outOffset = static_cast<int64_t>(start + t) * dim + c0; // GM byte offset for yGm[start+t]
-        PipeBarrier<PIPE_ALL>();                                          // (analyzer flags as redundant — already covered by the barrier above)
+        // P2.A: dropped pre-yGm PIPE_ALL — the L360 barrier above already drained V→MTE3.
         DataCopy(yGm[outOffset], outT[outSlot * MAX_BLOCK_DIM], dimTileSize);  // MTE3: UB outT slot → GM yGm
-        PipeBarrier<PIPE_ALL>();                                          // fence before next iter's prefetch overwrites a ring slot (loop-carried sync)
+        PipeBarrier<PIPE_ALL>();                                          // fence before next iter's prefetch overwrites a ring slot (loop-carried sync) — P2.C target
     }
 }
 
