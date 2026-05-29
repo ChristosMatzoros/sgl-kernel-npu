@@ -85,9 +85,10 @@ private:
 
 private:
     TPipe pipe;                           // owns UB allocation; passed to InitBuffer below
-    TBuf<QuePosition::VECIN>  inBuf;      // ring buffer of recent input tokens (RING_SLOTS * MAX_BLOCK_DIM * T)
-    TBuf<QuePosition::VECOUT> outBuf;     // staging area for outT before MTE3 writes it to yGm (2 * MAX_BLOCK_DIM * T)
+    TBuf<QuePosition::VECIN>  inBuf;      // ring buffer of recent input tokens (RING_SLOTS * dimTileSize * T)
+    TBuf<QuePosition::VECOUT> outBuf;     // staging area for outT before MTE3 writes it to yGm (2 * dimTileSize * T)
     TBuf<QuePosition::VECCALC> calcBuf;   // FP32 scratch: weightF + biasF + accF + tmpF, all back-to-back
+    TBuf<QuePosition::VECCALC> castedRingBuf;  // P5.D: FP32 mirror of inBuf — cast-once-per-prefetch cache
 
     // Pre-allocated cross-pipe event IDs. Reserved by AllocEvents() so the
     // optimized kernel can post/consume them, but UNUSED in this upstream
@@ -133,10 +134,26 @@ __aicore__ inline void CausalConv1d<T>::Init(GM_ADDR x, GM_ADDR weight, GM_ADDR 
     hasInitialStateGm.SetGlobalBuffer(reinterpret_cast<__gm__ bool *>(hasInitialState));
     yGm.SetGlobalBuffer(reinterpret_cast<__gm__ T *>(y));
 
-    // Reserve UB regions. Sizes are in BYTES.
-    pipe.InitBuffer(inBuf,  RING_SLOTS  * MAX_BLOCK_DIM * sizeof(T));      // 5 slots * max-dim * T
-    pipe.InitBuffer(outBuf, 2           * MAX_BLOCK_DIM * sizeof(T));      // 2-slot double buffer for outT
-    pipe.InitBuffer(calcBuf,(MAX_WIDTH + 3) * MAX_BLOCK_DIM * sizeof(float)); // FP32: weightF (4 slices) + biasF + accF + tmpF
+    // P5.D: dynamic UB allocation based on actual dimTileSize (host-chosen tile).
+    // Upstream allocated at MAX_BLOCK_DIM=4096 always, which wasted up to 75% of UB
+    // when the tiling picked a smaller dimTileSize. Sizing at dt opens room for the
+    // FP32 castedRing mirror that lets RunSeq's tap loop skip per-tap Casts.
+    //
+    // UB budget at dt (FP16):
+    //   inBuf        = 5 * dt * 2   = 10 * dt bytes
+    //   outBuf       = 2 * dt * 2   =  4 * dt bytes
+    //   calcBuf      = 7 * dt * 4   = 28 * dt bytes
+    //   castedRing   = 5 * dt * 4   = 20 * dt bytes
+    //   --------------------------------------------
+    //   total        = 62 * dt bytes
+    // At dt=1024 (worst case in current bench) -> 62 KB. UB ceiling is 192 KB so
+    // dt ≤ 3072 fits even with the FP32 mirror; the tiling never picks dt above
+    // 1024 on this bench. (Original layout used 168 KB at MAX_BLOCK_DIM=4096.)
+    const int32_t dt = static_cast<int32_t>(tilingData_->dimTileSize);
+    pipe.InitBuffer(inBuf,         RING_SLOTS    * dt * sizeof(T));
+    pipe.InitBuffer(outBuf,        2             * dt * sizeof(T));
+    pipe.InitBuffer(calcBuf,       (MAX_WIDTH + 3) * dt * sizeof(float));   // weightF (W slices) + biasF + accF + tmpF
+    pipe.InitBuffer(castedRingBuf, RING_SLOTS    * dt * sizeof(float));     // FP32 mirror of ring slots
 
     AllocEvents();
 }
@@ -181,13 +198,13 @@ __aicore__ inline void CausalConv1d<T>::LoadWeightAndBias(int32_t c0, int32_t di
     const bool dbgSync = dbg && CCONV_DBG_PRINT_SYNC;
     (void)dbgSync;                                  // silence "unused" when CCONV_DBG_PRINT_SYNC=false
 
-    // calcBuf layout (FP32, contiguous):
+    // calcBuf layout (FP32, contiguous, P5.D: stride = dimTileSize, not MAX_BLOCK_DIM):
     //   [weightF | biasF | accF | tmpF]
-    //   sizes:    MAX_WIDTH*MAX_BLOCK_DIM, MAX_BLOCK_DIM, MAX_BLOCK_DIM, MAX_BLOCK_DIM
-    LocalTensor<float> calc    = calcBuf.Get<float>();               // base pointer to the FP32 scratch region
-    LocalTensor<float> weightF = calc;                               // weights, FP32, indexed as weightF[j*MAX_BLOCK_DIM]
-    LocalTensor<float> biasF   = weightF[MAX_WIDTH * MAX_BLOCK_DIM]; // bias slice sits right after the W weight slices
-    LocalTensor<T>     tempT   = outBuf.Get<T>();                    // scratch in original-dtype: receives weight/bias from MTE2 before Cast
+    //   sizes:    MAX_WIDTH*dt, dt, dt, dt
+    LocalTensor<float> calc    = calcBuf.Get<float>();                  // base pointer to the FP32 scratch region
+    LocalTensor<float> weightF = calc;                                  // weights, FP32, indexed as weightF[j*dimTileSize]
+    LocalTensor<float> biasF   = weightF[MAX_WIDTH * dimTileSize];      // bias slice sits right after the W weight slices
+    LocalTensor<T>     tempT   = outBuf.Get<T>();                       // scratch in original-dtype: receives weight/bias from MTE2 before Cast
 
     // P1.A: surgical sync replaces all PIPE_ALL drains here. Two cross-pipe
     // deps on tempT that the kernel actually has:
@@ -214,7 +231,7 @@ __aicore__ inline void CausalConv1d<T>::LoadWeightAndBias(int32_t c0, int32_t di
         // MTE2→V RAW: gate V Cast on MTE2 write of tempT.
         SetFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
         WaitFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
-        Cast(weightF[j * MAX_BLOCK_DIM], tempT, RoundMode::CAST_NONE, dimTileSize); // V: tempT → weightF[j]
+        Cast(weightF[j * dimTileSize], tempT, RoundMode::CAST_NONE, dimTileSize);   // V: tempT → weightF[j]
         // V→MTE2 signal — only when there is a future MTE2 consumer of tempT
         // (either the next weight iter, or the bias load).
         const bool more_weight_iters = (j + 1 < MAX_WIDTH);
@@ -241,7 +258,8 @@ __aicore__ inline void CausalConv1d<T>::InitRing(int32_t cacheIdx, bool hasInit,
                                                  int32_t dimTileSize, int32_t dim, bool dbg)
 {
     const int32_t stateLen = tilingData_->stateLen;   // depth of the convStates cache (per cache line)
-    LocalTensor<T> ring = inBuf.Get<T>();             // ring buffer in UB: RING_SLOTS * MAX_BLOCK_DIM lanes of T
+    LocalTensor<T>     ring       = inBuf.Get<T>();             // ring buffer in UB: RING_SLOTS * dimTileSize lanes of T
+    LocalTensor<float> castedRing = castedRingBuf.Get<float>(); // P5.D: FP32 mirror of ring
 
     PipeBarrier<PIPE_ALL>();                          // fence prior LoadWeightAndBias work before we touch `ring`
     if (hasInit) {
@@ -251,12 +269,12 @@ __aicore__ inline void CausalConv1d<T>::InitRing(int32_t cacheIdx, bool hasInit,
             // 3D offset into convStatesGm: [cacheIdx, i, c0:c0+dimTileSize]
             const int64_t stateOffset =                                       // GM byte offset of state row (cacheIdx, i)
                 static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(i) * dim + c0;
-            DataCopy(ring[i * MAX_BLOCK_DIM], convStatesGm[stateOffset], dimTileSize); // MTE2: GM → UB slot i
+            DataCopy(ring[i * dimTileSize], convStatesGm[stateOffset], dimTileSize); // MTE2: GM → UB slot i
         }
     } else {
         // First call for this sequence: zero out the history so taps see implicit padding.
         for (int32_t i = 0; i < (MAX_WIDTH - 1); ++i) {
-            Duplicate(ring[i * MAX_BLOCK_DIM], static_cast<T>(0), dimTileSize); // V: writes 0 into ring slot i
+            Duplicate(ring[i * dimTileSize], static_cast<T>(0), dimTileSize); // V: writes 0 into ring slot i
         }
     }
     PipeBarrier<PIPE_ALL>();                          // separate history fill from the first-token prefetch below
@@ -266,8 +284,15 @@ __aicore__ inline void CausalConv1d<T>::InitRing(int32_t cacheIdx, bool hasInit,
         // read at t=0. SlotCurr(0) maps token t=0 to its rotating-ring slot.
         const int64_t xOffset = static_cast<int64_t>(start) * dim + c0;            // GM byte offset of xGm[start]
         // P4.A: dropped pre-prefetch PIPE_ALL — L262 above already drained all pipes.
-        DataCopy(ring[SlotCurr(0) * MAX_BLOCK_DIM], xGm[xOffset], dimTileSize);    // MTE2: GM → UB slot[SlotCurr(0)]
+        DataCopy(ring[SlotCurr(0) * dimTileSize], xGm[xOffset], dimTileSize);      // MTE2: GM → UB slot[SlotCurr(0)]
         PipeBarrier<PIPE_ALL>();                                                   // fence so RunSeq's first Cast sees the prefetched slot
+        // P5.D: prime the FP32 mirror. RunSeq iter 0 reads taps from slots
+        // {SlotHist(0,3), SlotHist(0,2), SlotHist(0,1), SlotCurr(0)} = {0,1,2,3};
+        // cast every slot RunSeq could read at iter 0..3 before its first prefetch
+        // catches up — that's slots 0..MAX_WIDTH-1 inclusive (4 slots, 0..3).
+        for (int32_t i = 0; i < MAX_WIDTH; ++i) {
+            Cast(castedRing[i * dimTileSize], ring[i * dimTileSize], RoundMode::CAST_NONE, dimTileSize);
+        }
     }
 }
 
@@ -276,13 +301,15 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
                                                bool dbg)
 {
     // ── Re-derive views into the shared UB buffers (same layout as LoadWeightAndBias) ──
-    LocalTensor<float> calc    = calcBuf.Get<float>();                  // base pointer to the FP32 scratch region
-    LocalTensor<float> weightF = calc;                                  // weights view — already filled by LoadWeightAndBias
-    LocalTensor<float> biasF   = weightF[MAX_WIDTH * MAX_BLOCK_DIM];    // bias view — sits right after the W weight slices
-    LocalTensor<float> accF    = biasF[MAX_BLOCK_DIM];                  // per-token FP32 accumulator (reset to biasF every iter)
-    LocalTensor<float> tmpF    = accF[MAX_BLOCK_DIM];                   // per-tap FP32 scratch (also receives Silu(accF))
-    LocalTensor<T>     ring    = inBuf.Get<T>();                        // ring of recent input tokens (already primed by InitRing)
-    LocalTensor<T>     outT    = outBuf.Get<T>();                       // 2-slot output stage (double-buffered by outSlot)
+    // P5.D: stride is dimTileSize (dynamic) rather than MAX_BLOCK_DIM.
+    LocalTensor<float> calc       = calcBuf.Get<float>();                   // base pointer to the FP32 scratch region
+    LocalTensor<float> weightF    = calc;                                   // weights view — already filled by LoadWeightAndBias
+    LocalTensor<float> biasF      = weightF[MAX_WIDTH * dimTileSize];       // bias view — sits right after the W weight slices
+    LocalTensor<float> accF       = biasF[dimTileSize];                     // per-token FP32 accumulator
+    LocalTensor<float> tmpF       = accF[dimTileSize];                      // FP32 scratch (Silu dst; not used by tap loop in P5.D)
+    LocalTensor<T>     ring       = inBuf.Get<T>();                         // ring of recent input tokens (T)
+    LocalTensor<float> castedRing = castedRingBuf.Get<float>();             // P5.D: FP32 cast-once mirror of ring slots
+    LocalTensor<T>     outT       = outBuf.Get<T>();                        // 2-slot output stage (double-buffered by outSlot)
 
     const bool dbgSync = dbg && CCONV_DBG_PRINT_SYNC;                    // gates per-iter sync prints (debug only)
     (void)dbgSync;                                                       // silence "unused" warning when DBG=false
@@ -316,20 +343,26 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
 
         // P2.B: wait for prev iter's MTE2 prefetch of slotCurr (RAW). Iter 0 has
         // no prior set — InitRing's PIPE_ALL drains MTE2 before RunSeq starts.
-        // P2.C: also wait for prev iter's V Cast (j=0, tap=3) to be done reading
-        // slotPref(t), the slot this iter's MTE2 prefetch is about to overwrite.
-        // slotHist(t-1, 3) == slotPref(t) always (both = (t-4)%5 == (t+1)%5 mod 5).
+        // P2.C: also wait for prev iter's V Cast on the slot this iter's MTE2 prefetch
+        // is about to overwrite (loop-carried WAR on `ring`).
         if (t > 0) {
             WaitFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_);
             WaitFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
+            // P5.D: cast the newly-prefetched slot (slotCurr at iter t was written by
+            // iter t-1's prefetch). Doing it here, after MTE2_V wait and before the tap
+            // loop, means the V pipe processes (Cast slotCurr) → (4× MulAddDst from
+            // castedRing) sequentially in FIFO — but the tap loop's 3 history-slot
+            // reads now hit the FP32 mirror without per-tap Casts (3 V ops saved/token).
+            Cast(castedRing[slotCurr * dimTileSize], ring[slotCurr * dimTileSize],
+                 RoundMode::CAST_NONE, dimTileSize);
         }
 
         // ── Prefetch next input token while we compute this one ──────────
         if (t + 1 < len) {
             // Load xGm[start + t + 1] into the slot RunSeq will consume at iter t+1.
             const int64_t xOffset = static_cast<int64_t>(start + t + 1) * dim + c0; // GM byte offset of next token, this dim block
-            // P2.C: dropped L314/L320 pre-prefetch PIPE_ALL — V→MTE2 WAR is now covered by the WaitFlag<V_MTE2> above.
-            DataCopy(ring[slotPref * MAX_BLOCK_DIM], xGm[xOffset], dimTileSize); // MTE2: GM → UB slot[slotPref]
+            // P2.C: dropped pre-prefetch PIPE_ALL — V→MTE2 WAR is now covered by the WaitFlag<V_MTE2> above.
+            DataCopy(ring[slotPref * dimTileSize], xGm[xOffset], dimTileSize);    // MTE2: GM → UB slot[slotPref]
             // P2.B: signal MTE2 prefetch complete — next iter's WaitFlag<MTE2_V> pops this.
             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_);
         }
@@ -342,31 +375,24 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
             DataCopy(accF, biasF, dimTileSize);                          // V: accF ← biasF (hasBias path)
         }
 
-        // ── Width-4 multiply-add: accF += weightF[j] * cast(ring[tap]) for each tap ──
+        // ── Width-4 multiply-add (P5.D: reads FP32 castedRing, NO per-tap Cast) ──
         // Tap order is reversed (j=0 → oldest tap = (t-3), j=W-1 → current token = t).
-        // P2.B: dropped per-tap PIPE_ALL (L328) — single WaitFlag<MTE2_V> at iter entry
-        // covers MTE2→V sync for slotCurr (the slot prefetched at iter t-1). History
-        // slots (taps 1..3) were prefetched many iters ago; since MTE2 is FIFO, waiting
-        // on iter t-1's prefetch transitively drains every earlier MTE2 op on the ring.
-        // For the very first iters before the prefetch queue is primed, InitRing's
-        // pre-RunSeq PIPE_ALL drain handles visibility instead.
+        // castedRing[slot] holds the FP32-casted value of ring[slot]. Slots are kept
+        // up-to-date by InitRing (4 initial casts) + iter-start Cast (1 per iter after).
         for (int32_t j = 0; j < MAX_WIDTH; ++j) {
             const int32_t tap  = (MAX_WIDTH - 1) - j;                    // tap index counting back from t (3,2,1,0)
             const int32_t slot = (tap == 0) ? slotCurr : SlotHist(t, tap); // which ring slot this tap lives in
-            Cast(tmpF, ring[slot * MAX_BLOCK_DIM], RoundMode::CAST_NONE, dimTileSize); // V: T → FP32 into tmpF
-            // P2.C: after j=0 (tap=3 = slotPref(t+1)) Cast, signal that V is done
-            // reading the slot next iter's MTE2 prefetch will overwrite. Place the
-            // SetFlag as early as possible to maximize MTE2/V overlap.
+            // P2.C: after j=0 (the V op that read slotHist(t,3) == slotPref(t+1)),
+            // signal V is done with the slot next iter's MTE2 prefetch will overwrite.
+            // P5.D: the read is the MulAddDst below (j=0), no separate Cast needed.
             if (j == 0 && t + 1 < len) {
                 SetFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
             }
-            // P5.C: Mul-init: at j=0 in the !hasBias path, accF is uninitialised so
-            // use Mul (replaces the DataCopy(accF, 0) we just skipped). For all other
-            // j or for the hasBias path, MulAddDst accumulates into accF normally.
+            // P5.C: Mul-init at j=0 in the !hasBias path (accF was never initialised).
             if (useMulInit && j == 0) {
-                Mul(accF, tmpF, weightF[0], dimTileSize);                // V: accF = tap_0 * w_0 (init via Mul, no prior DataCopy)
+                Mul(accF, castedRing[slot * dimTileSize], weightF[0], dimTileSize);
             } else {
-                MulAddDst(accF, tmpF, weightF[j * MAX_BLOCK_DIM], dimTileSize); // V: accF += tap_j * w_j
+                MulAddDst(accF, castedRing[slot * dimTileSize], weightF[j * dimTileSize], dimTileSize);
             }
         }
 
@@ -390,16 +416,16 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
         if constexpr (IsSameType<T, float>::value) {
             // T == float: result is already FP32, just move it into the outT slot.
             if (hasActivation) {
-                DataCopy(outT[outSlot * MAX_BLOCK_DIM], tmpF, dimTileSize);             // V: outT[outSlot] ← tmpF (post-Silu)
+                DataCopy(outT[outSlot * dimTileSize], tmpF, dimTileSize);              // V: outT[outSlot] ← tmpF (post-Silu)
             } else {
-                DataCopy(outT[outSlot * MAX_BLOCK_DIM], accF, dimTileSize);             // V: outT[outSlot] ← accF (raw conv)
+                DataCopy(outT[outSlot * dimTileSize], accF, dimTileSize);              // V: outT[outSlot] ← accF (raw conv)
             }
         } else {
             // T is fp16/bf16: Cast FP32 → T using round-to-nearest.
             if (hasActivation) {
-                Cast(outT[outSlot * MAX_BLOCK_DIM], tmpF, RoundMode::CAST_RINT, dimTileSize); // V: outT[outSlot] ← (T)tmpF
+                Cast(outT[outSlot * dimTileSize], tmpF, RoundMode::CAST_RINT, dimTileSize); // V: outT[outSlot] ← (T)tmpF
             } else {
-                Cast(outT[outSlot * MAX_BLOCK_DIM], accF, RoundMode::CAST_RINT, dimTileSize); // V: outT[outSlot] ← (T)accF
+                Cast(outT[outSlot * dimTileSize], accF, RoundMode::CAST_RINT, dimTileSize); // V: outT[outSlot] ← (T)accF
             }
         }
         // P3.A: V→MTE3 RAW — signal MTE3 may now read outT[outSlot]. Replaces L376 PIPE_ALL.
@@ -409,7 +435,7 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
         const int64_t outOffset = static_cast<int64_t>(start + t) * dim + c0; // GM byte offset for yGm[start+t]
         // P3.A: paired wait for the V→MTE3 set above; stalls MTE3 only (not all pipes).
         WaitFlag<HardEvent::V_MTE3>(outVToMte3Event_[outSlot]);
-        DataCopy(yGm[outOffset], outT[outSlot * MAX_BLOCK_DIM], dimTileSize);  // MTE3: UB outT slot → GM yGm
+        DataCopy(yGm[outOffset], outT[outSlot * dimTileSize], dimTileSize);    // MTE3: UB outT slot → GM yGm
         // P3.A: MTE3→V WAR — signal MTE3 done reading outT[outSlot]. Iter t+2's pack waits on this.
         SetFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
         // P2.C: dropped L366/L372 post-yGm PIPE_ALL — V→MTE2 WAR on ring is now covered by
@@ -452,7 +478,7 @@ __aicore__ inline void CausalConv1d<T>::WriteBackState(int32_t cacheIdx, int32_t
         const int32_t slot = (tap == 0) ? SlotCurr(lastT) : SlotHist(lastT, tap);     // which ring slot the tap currently lives in
         const int64_t stateOffset =                                                   // GM byte offset: [cacheIdx, pos, c0:c0+dimTileSize]
             static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(pos) * dim + c0;
-        DataCopy(convStatesGm[stateOffset], ring[slot * MAX_BLOCK_DIM], dimTileSize); // MTE3: UB ring slot → GM convStates row
+        DataCopy(convStatesGm[stateOffset], ring[slot * dimTileSize], dimTileSize); // MTE3: UB ring slot → GM convStates row
     }
 }
 
