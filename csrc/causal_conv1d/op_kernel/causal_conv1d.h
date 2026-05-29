@@ -89,11 +89,12 @@ private:
     TBuf<QuePosition::VECOUT> outBuf;     // staging area for outT before MTE3 writes it to yGm (2 * MAX_BLOCK_DIM * T)
     TBuf<QuePosition::VECCALC> calcBuf;   // FP32 scratch: weightF + biasF + accF + tmpF, all back-to-back
 
-    // Pre-allocated cross-pipe event IDs. Reserved by AllocEvents() so the
-    // optimized kernel can post/consume them, but UNUSED in this upstream
-    // version — see AllocEvents() comment above.
-    TEventID tempVToMte2Event_;           // V → MTE2 (PR-1 uses for "weight scratch free")
-    TEventID tempMte2ToVEvent_;           // MTE2 → V (PR-1 uses for weight/bias load handshake)
+    // Cross-pipe event IDs (allocated in AllocEvents).
+    //   P1.A uses tempMte2ToV/tempVToMte2 to gate MTE2↔V on tempT in LoadW.
+    //   P1.B doubles them per outBuf slot so MTE2 row j+1 can write slot
+    //        (j+1)&1 while V Cast row j is still reading slot j&1.
+    TEventID tempVToMte2Event_[2];        // P1.B: V → MTE2, per tempT slot 0/1
+    TEventID tempMte2ToVEvent_[2];        // P1.B: MTE2 → V, per tempT slot 0/1
     TEventID inputMte2ToVEvent_;          // MTE2 → V (PR-1 uses to gate ring fill handoff)
     TEventID outMte3ToVEvent_[2];         // MTE3 → V, one per outSlot 0/1 (double-buffered output)
     TEventID outVToMte3Event_[2];         // V → MTE3, one per outSlot 0/1
@@ -151,9 +152,11 @@ __aicore__ inline void CausalConv1d<T>::Init(GM_ADDR x, GM_ADDR weight, GM_ADDR 
 template <typename T>
 __aicore__ inline void CausalConv1d<T>::AllocEvents()
 {
-    tempVToMte2Event_   = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();   // V finished using weight scratch → MTE2 may overwrite
-    tempMte2ToVEvent_   = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();   // MTE2 finished loading weights/bias → V may Cast
-    inputMte2ToVEvent_  = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();   // MTE2 finished prefetching ring slot → V may read it
+    tempVToMte2Event_[0] = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();  // V done with tempT slot 0 → MTE2 may overwrite
+    tempVToMte2Event_[1] = GetTPipePtr()->AllocEventID<HardEvent::V_MTE2>();  // V done with tempT slot 1 → MTE2 may overwrite
+    tempMte2ToVEvent_[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();  // MTE2 wrote tempT slot 0 → V may Cast
+    tempMte2ToVEvent_[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();  // MTE2 wrote tempT slot 1 → V may Cast
+    inputMte2ToVEvent_   = GetTPipePtr()->AllocEventID<HardEvent::MTE2_V>();  // MTE2 finished prefetching ring slot → V may read it
     outMte3ToVEvent_[0] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();   // MTE3 done with outT[0] → V may overwrite next iter
     outMte3ToVEvent_[1] = GetTPipePtr()->AllocEventID<HardEvent::MTE3_V>();   // …same for outT[1] (double-buffered)
     outVToMte3Event_[0] = GetTPipePtr()->AllocEventID<HardEvent::V_MTE3>();   // V finished writing outT[0] → MTE3 may store to yGm
@@ -165,8 +168,10 @@ __aicore__ inline void CausalConv1d<T>::AllocEvents()
 template <typename T>
 __aicore__ inline void CausalConv1d<T>::ReleaseEvents()
 {
-    GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE2>(tempVToMte2Event_);
-    GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(tempMte2ToVEvent_);
+    GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE2>(tempVToMte2Event_[0]);
+    GetTPipePtr()->ReleaseEventID<HardEvent::V_MTE2>(tempVToMte2Event_[1]);
+    GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(tempMte2ToVEvent_[0]);
+    GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(tempMte2ToVEvent_[1]);
     GetTPipePtr()->ReleaseEventID<HardEvent::MTE2_V>(inputMte2ToVEvent_);
     GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_V>(outMte3ToVEvent_[0]);
     GetTPipePtr()->ReleaseEventID<HardEvent::MTE3_V>(outMte3ToVEvent_[1]);
@@ -187,52 +192,81 @@ __aicore__ inline void CausalConv1d<T>::LoadWeightAndBias(int32_t c0, int32_t di
     LocalTensor<float> calc    = calcBuf.Get<float>();               // base pointer to the FP32 scratch region
     LocalTensor<float> weightF = calc;                               // weights, FP32, indexed as weightF[j*MAX_BLOCK_DIM]
     LocalTensor<float> biasF   = weightF[MAX_WIDTH * MAX_BLOCK_DIM]; // bias slice sits right after the W weight slices
-    LocalTensor<T>     tempT   = outBuf.Get<T>();                    // scratch in original-dtype: receives weight/bias from MTE2 before Cast
+    // (P1.A's single tempT is gone — P1.B introduces a 2-slot view below.)
 
-    // P1.A: surgical sync replaces all PIPE_ALL drains here. Two cross-pipe
-    // deps on tempT that the kernel actually has:
-    //   • MTE2 → V RAW  : V's Cast reads bytes MTE2 just wrote        →  SetFlag<MTE2_V>
-    //   • V → MTE2 WAR  : MTE2 in iter j+1 (or bias load) overwrites
-    //                     bytes V Cast of iter j is still reading      →  SetFlag<V_MTE2>
+    // P1.B: double-buffered tempT.  outBuf already has 2*MAX_BLOCK_DIM bytes
+    // (originally for outT[0/1] in RunSeq); we reuse it here as tempT[0/1].
+    // No UB increase, MAX_BLOCK_DIM unchanged.
     //
-    // Set/Wait counts (must balance per LoadW invocation):
-    //   MTE2_V : W Sets + (hasBias ? 1 : 0)  /  same Waits
-    //   V_MTE2 : (W-1) Sets between weight iters + (hasBias ? 1 : 0) for
-    //            the bias entry  /  matching Waits.
+    // Software pipeline:
     //
-    // No leading fence: prev task's WriteBackState ends with a PIPE_ALL
-    // (still upstream-style for now) → MTE3 drained on entry. No cross-task
-    // tempT race (prev task didn't touch tempT/outBuf in WriteBackState).
-    // No trailing fence: RunSeq reads weightF/biasF on V (same pipe, FIFO).
-    for (int32_t j = 0; j < MAX_WIDTH; ++j) {
-        const int64_t weightOffset = static_cast<int64_t>(j) * dim + c0;
-        // V→MTE2 WAR: wait for prev iter's V Cast to release tempT.
-        if (j > 0) {
-            WaitFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
+    //   prime  : MTE2 row 0  → Set MTE2_V[0]
+    //   loop j=1..W-1 :
+    //       (j>=2) Wait V_MTE2[j&1]              ← WAR: V at j-2 done with slot
+    //       MTE2 row j into tempT[j&1]
+    //       Set MTE2_V[j&1]
+    //       Wait MTE2_V[(j-1)&1]                 ← RAW: MTE2 row j-1 done
+    //       V Cast row j-1 from tempT[(j-1)&1]
+    //       Set V_MTE2[(j-1)&1]                  ← always consumed (see below)
+    //   tail   : Wait MTE2_V[(W-1)&1]; V Cast row W-1
+    //   bias   : uses the slot V Cast last released (NOT the last_slot)
+    //
+    // Slot index pattern (W=4): MTE2 writes 0,1,0,1 ; V reads 0,1,0,1.
+    // Every V_MTE2[prev_slot] Set inside the loop is consumed by the very
+    // next loop iter's MTE2 (since (j-1)&1 == (j+1)&1 — both are !slot).
+    // The Set posted at j=W-1 lands on slot (W-2)&1 — picked up by bias's
+    // MTE2 (which deliberately reuses that slot) or by a defensive Wait
+    // on the !hasBias path.
+    constexpr int W = MAX_WIDTH;
+    LocalTensor<T> tempT = outBuf.Get<T>();          // 2 slots, each MAX_BLOCK_DIM × T
+
+    // ── prime: MTE2 row 0 into slot 0 ───────────────────────────────────
+    DataCopy(tempT[0], weightGm[c0], dimTileSize);
+    SetFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_[0]);
+
+    // ── pipelined loop: prefetch row j while V casts row j-1 ────────────
+    for (int32_t j = 1; j < W; ++j) {
+        const int32_t slot      = j & 1;
+        const int32_t prev_slot = (j - 1) & 1;
+        const int64_t weight_off = static_cast<int64_t>(j) * dim + c0;
+
+        // MTE2 row j (overlaps with V Cast row j-1 below).
+        if (j >= 2) {
+            // WAR: V at j-2 used this slot — wait for it before overwriting.
+            WaitFlag<HardEvent::V_MTE2>(tempVToMte2Event_[slot]);
         }
-        DataCopy(tempT, weightGm[weightOffset], dimTileSize);        // MTE2: GM → tempT
-        // MTE2→V RAW: gate V Cast on MTE2 write of tempT.
-        SetFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
-        WaitFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
-        Cast(weightF[j * MAX_BLOCK_DIM], tempT, RoundMode::CAST_NONE, dimTileSize); // V: tempT → weightF[j]
-        // V→MTE2 signal — only when there is a future MTE2 consumer of tempT
-        // (either the next weight iter, or the bias load).
-        const bool more_weight_iters = (j + 1 < MAX_WIDTH);
-        const bool bias_will_consume = (tilingData_->hasBias != 0);
-        if (more_weight_iters || bias_will_consume) {
-            SetFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
-        }
+        DataCopy(tempT[slot * MAX_BLOCK_DIM], weightGm[weight_off], dimTileSize);
+        SetFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_[slot]);
+
+        // V Cast row j-1.
+        WaitFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_[prev_slot]);
+        Cast(weightF[(j - 1) * MAX_BLOCK_DIM], tempT[prev_slot * MAX_BLOCK_DIM],
+             RoundMode::CAST_NONE, dimTileSize);
+        // Always Set — consumed by the next loop iter's MTE2 OR by the bias
+        // Wait (if hasBias) OR by the defensive Wait on the !hasBias path.
+        SetFlag<HardEvent::V_MTE2>(tempVToMte2Event_[prev_slot]);
     }
 
+    // ── tail: V Cast row W-1 (paired with the last loop-issued MTE2) ───
+    constexpr int32_t last_slot = (W - 1) & 1;        // 1 for W=4
+    WaitFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_[last_slot]);
+    Cast(weightF[(W - 1) * MAX_BLOCK_DIM], tempT[last_slot * MAX_BLOCK_DIM],
+         RoundMode::CAST_NONE, dimTileSize);
+
+    // ── bias path: reuses the slot the loop's last V_MTE2 Set targets ──
+    // The j=W-1 loop iter set V_MTE2[(W-2)&1] = V_MTE2[bias_slot]. We
+    // consume it either with the bias's MTE2 or a defensive Wait below.
+    constexpr int32_t bias_slot = (W - 2) & 1;        // 0 for W=4 — opposite of last_slot
     if (tilingData_->hasBias != 0) {
-        // V→MTE2 WAR: wait for last weight Cast's tempT read to retire.
-        WaitFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
-        DataCopy(tempT, biasGm[c0], dimTileSize);                    // MTE2: GM → tempT
-        SetFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
-        WaitFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
-        Cast(biasF, tempT, RoundMode::CAST_NONE, dimTileSize);       // V: tempT → biasF
+        WaitFlag<HardEvent::V_MTE2>(tempVToMte2Event_[bias_slot]);
+        DataCopy(tempT[bias_slot * MAX_BLOCK_DIM], biasGm[c0], dimTileSize);
+        SetFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_[bias_slot]);
+        WaitFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_[bias_slot]);
+        Cast(biasF, tempT[bias_slot * MAX_BLOCK_DIM], RoundMode::CAST_NONE, dimTileSize);
     } else {
-        Duplicate(biasF, 0.0f, dimTileSize);                         // V: biasF ← 0
+        Duplicate(biasF, 0.0f, dimTileSize);
+        // Drain the leftover V_MTE2[bias_slot] Set from the last loop iter.
+        WaitFlag<HardEvent::V_MTE2>(tempVToMte2Event_[bias_slot]);
     }
 }
 
