@@ -287,6 +287,13 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
     const bool dbgSync = dbg && CCONV_DBG_PRINT_SYNC;                    // gates per-iter sync prints (debug only)
     (void)dbgSync;                                                       // silence "unused" warning when DBG=false
     const bool hasActivation = (tilingData_->activationMode != 0);       // SiLU on/off, decided by the host
+    // P5.C: when there is no bias, biasF was Duplicate'd to 0 by LoadW. The
+    // upstream pattern `DataCopy(accF, biasF) + 4× MulAddDst` produces
+    // `accF = 0 + sum tap*w = sum tap*w`. We can drop the accF-init DataCopy
+    // and start with `Mul` on the j=0 tap, saving 1 V op per token. The path
+    // with bias is left untouched (PR-3 noted re-ordering the bias add breaks
+    // the dense3d_mixed_bias_act test on this NPU).
+    const bool useMulInit = (tilingData_->hasBias == 0);
     const int32_t dbgMaxTokens     = CCONV_DBG_MAX_TOKENS;               // how many leading tokens get any debug dump
     const int32_t dbgVerboseTokens = CCONV_DBG_VERBOSE_TOKENS;           // of those, how many get the full per-tap trace
 
@@ -327,9 +334,13 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_);
         }
 
-        // ── Init accumulator to bias ─────────────────────────────────────
-        // Intra-UB DataCopy on the V pipe: accF ← biasF. With hasBias=false biasF is just zeros.
-        DataCopy(accF, biasF, dimTileSize);                              // V: accF ← biasF (resets the accumulator each token)
+        // ── Init accumulator ─────────────────────────────────────────────
+        // P5.C: Mul-init when !hasBias — skip the DataCopy(accF, biasF=0) and use
+        // Mul for the j=0 tap below (accF = tap_0 * w_0). When hasBias, keep the
+        // DataCopy and rely on the loop's MulAddDsts (accF = bias + sum tap*w).
+        if (!useMulInit) {
+            DataCopy(accF, biasF, dimTileSize);                          // V: accF ← biasF (hasBias path)
+        }
 
         // ── Width-4 multiply-add: accF += weightF[j] * cast(ring[tap]) for each tap ──
         // Tap order is reversed (j=0 → oldest tap = (t-3), j=W-1 → current token = t).
@@ -349,7 +360,14 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
             if (j == 0 && t + 1 < len) {
                 SetFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
             }
-            MulAddDst(accF, tmpF, weightF[j * MAX_BLOCK_DIM], dimTileSize);          // V: accF += tmpF * weightF[j]  (in-place accumulate)
+            // P5.C: Mul-init: at j=0 in the !hasBias path, accF is uninitialised so
+            // use Mul (replaces the DataCopy(accF, 0) we just skipped). For all other
+            // j or for the hasBias path, MulAddDst accumulates into accF normally.
+            if (useMulInit && j == 0) {
+                Mul(accF, tmpF, weightF[0], dimTileSize);                // V: accF = tap_0 * w_0 (init via Mul, no prior DataCopy)
+            } else {
+                MulAddDst(accF, tmpF, weightF[j * MAX_BLOCK_DIM], dimTileSize); // V: accF += tap_j * w_j
+            }
         }
 
         // Optional SiLU activation: tmpF = silu(accF). Separate dst tensor —
