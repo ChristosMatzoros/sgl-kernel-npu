@@ -189,30 +189,51 @@ __aicore__ inline void CausalConv1d<T>::LoadWeightAndBias(int32_t c0, int32_t di
     LocalTensor<float> biasF   = weightF[MAX_WIDTH * MAX_BLOCK_DIM]; // bias slice sits right after the W weight slices
     LocalTensor<T>     tempT   = outBuf.Get<T>();                    // scratch in original-dtype: receives weight/bias from MTE2 before Cast
 
-    // Load the W weight rows one at a time. Each row j is a `dim`-sized vector
-    // at weightGm[j*dim + c0]; we only need our `dimTileSize` slice. After
-    // loading, Cast to FP32 into the j-th slot of weightF.
+    // P1.A: surgical sync replaces all PIPE_ALL drains here. Two cross-pipe
+    // deps on tempT that the kernel actually has:
+    //   • MTE2 → V RAW  : V's Cast reads bytes MTE2 just wrote        →  SetFlag<MTE2_V>
+    //   • V → MTE2 WAR  : MTE2 in iter j+1 (or bias load) overwrites
+    //                     bytes V Cast of iter j is still reading      →  SetFlag<V_MTE2>
+    //
+    // Set/Wait counts (must balance per LoadW invocation):
+    //   MTE2_V : W Sets + (hasBias ? 1 : 0)  /  same Waits
+    //   V_MTE2 : (W-1) Sets between weight iters + (hasBias ? 1 : 0) for
+    //            the bias entry  /  matching Waits.
+    //
+    // No leading fence: prev task's WriteBackState ends with a PIPE_ALL
+    // (still upstream-style for now) → MTE3 drained on entry. No cross-task
+    // tempT race (prev task didn't touch tempT/outBuf in WriteBackState).
+    // No trailing fence: RunSeq reads weightF/biasF on V (same pipe, FIFO).
     for (int32_t j = 0; j < MAX_WIDTH; ++j) {
-        const int64_t weightOffset = static_cast<int64_t>(j) * dim + c0;        // GM byte offset of row j, dim-block c0
-        PipeBarrier<PIPE_ALL>();                                     // drain so the previous iter's V Cast can't race with this MTE2 load
-        DataCopy(tempT, weightGm[weightOffset], dimTileSize);        // MTE2: GM → UB (tempT)
-        PipeBarrier<PIPE_ALL>();                                     // drain so V Cast below sees the bytes MTE2 just wrote
-        Cast(weightF[j * MAX_BLOCK_DIM], tempT, RoundMode::CAST_NONE, dimTileSize); // V: tempT (T) → weightF[j] (FP32)
-        PipeBarrier<PIPE_ALL>();                                     // drain so next iter's MTE2 doesn't overwrite tempT while V still reads it
+        const int64_t weightOffset = static_cast<int64_t>(j) * dim + c0;
+        // V→MTE2 WAR: wait for prev iter's V Cast to release tempT.
+        if (j > 0) {
+            WaitFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
+        }
+        DataCopy(tempT, weightGm[weightOffset], dimTileSize);        // MTE2: GM → tempT
+        // MTE2→V RAW: gate V Cast on MTE2 write of tempT.
+        SetFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
+        WaitFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
+        Cast(weightF[j * MAX_BLOCK_DIM], tempT, RoundMode::CAST_NONE, dimTileSize); // V: tempT → weightF[j]
+        // V→MTE2 signal — only when there is a future MTE2 consumer of tempT
+        // (either the next weight iter, or the bias load).
+        const bool more_weight_iters = (j + 1 < MAX_WIDTH);
+        const bool bias_will_consume = (tilingData_->hasBias != 0);
+        if (more_weight_iters || bias_will_consume) {
+            SetFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
+        }
     }
 
     if (tilingData_->hasBias != 0) {
-        // hasBias path: load and FP32-cast biasGm into biasF.
-        PipeBarrier<PIPE_ALL>();                                     // fence weight-loop's last V Cast before reusing tempT for bias
-        DataCopy(tempT, biasGm[c0], dimTileSize);                    // MTE2: GM → UB (tempT, reused now that weight loads are done)
-        PipeBarrier<PIPE_ALL>();                                     // fence so V Cast sees the new tempT bytes
-        Cast(biasF, tempT, RoundMode::CAST_NONE, dimTileSize);       // V: tempT (T) → biasF (FP32)
-        PipeBarrier<PIPE_ALL>();                                     // fence so the trailing PIPE_ALL drain below sees biasF stable
+        // V→MTE2 WAR: wait for last weight Cast's tempT read to retire.
+        WaitFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
+        DataCopy(tempT, biasGm[c0], dimTileSize);                    // MTE2: GM → tempT
+        SetFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
+        WaitFlag<HardEvent::MTE2_V>(tempMte2ToVEvent_);
+        Cast(biasF, tempT, RoundMode::CAST_NONE, dimTileSize);       // V: tempT → biasF
     } else {
-        // No bias: write zero into biasF so the conv accumulator can still start from biasF.
-        Duplicate(biasF, 0.0f, dimTileSize);                         // V: writes 0.0f to all dimTileSize lanes of biasF
+        Duplicate(biasF, 0.0f, dimTileSize);                         // V: biasF ← 0
     }
-    PipeBarrier<PIPE_ALL>();                                         // fence so RunSeq below sees the final weightF/biasF state
 }
 
 template <typename T>
