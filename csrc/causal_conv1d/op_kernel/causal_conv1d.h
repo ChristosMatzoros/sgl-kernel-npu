@@ -358,6 +358,14 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
             Silu(tmpF, accF, dimTileSize);                                // V: tmpF ← silu(accF)
         }
 
+        // P3.A: loop-carried MTE3→V WAR on outT[outSlot] (double-buffer, 2-iter distance).
+        // outSlot alternates 0/1, so at iter t we may overwrite the same outT[outSlot]
+        // that iter t-2's MTE3 was still reading. Wait until that prior MTE3 finished.
+        // First reuse of outSlot=0 happens at iter 2; first reuse of outSlot=1 at iter 3.
+        if (t >= 2) {
+            WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
+        }
+
         // ── Pack result into outT (slot 0 or 1 depending on outSlot) ─────
         // FP32 path keeps DataCopy (intra-UB on V); narrower dtypes need a Cast back from FP32.
         // P2.A: dropped pre-pack PIPE_ALL — Silu/MulAddDst/DataCopy/Cast are all V-pipe ops, FIFO-ordered.
@@ -376,15 +384,28 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
                 Cast(outT[outSlot * MAX_BLOCK_DIM], accF, RoundMode::CAST_RINT, dimTileSize); // V: outT[outSlot] ← (T)accF
             }
         }
-        PipeBarrier<PIPE_ALL>();                                          // gate so MTE3 below sees the outT write V just made (cross-pipe V→MTE3 RAW) — Phase 3 target
+        // P3.A: V→MTE3 RAW — signal MTE3 may now read outT[outSlot]. Replaces L376 PIPE_ALL.
+        SetFlag<HardEvent::V_MTE3>(outVToMte3Event_[outSlot]);
 
         // ── Store this token's output to yGm ─────────────────────────────
         const int64_t outOffset = static_cast<int64_t>(start + t) * dim + c0; // GM byte offset for yGm[start+t]
-        // P2.A: dropped pre-yGm PIPE_ALL — the L360 barrier above already drained V→MTE3.
+        // P3.A: paired wait for the V→MTE3 set above; stalls MTE3 only (not all pipes).
+        WaitFlag<HardEvent::V_MTE3>(outVToMte3Event_[outSlot]);
         DataCopy(yGm[outOffset], outT[outSlot * MAX_BLOCK_DIM], dimTileSize);  // MTE3: UB outT slot → GM yGm
+        // P3.A: MTE3→V WAR — signal MTE3 done reading outT[outSlot]. Iter t+2's pack waits on this.
+        SetFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[outSlot]);
         // P2.C: dropped L366/L372 post-yGm PIPE_ALL — V→MTE2 WAR on ring is now covered by
-        // SetFlag<V_MTE2>/WaitFlag pair; MTE3 store of outT[outSlot] is serialized at the
-        // next iter's L360 PIPE_ALL (Phase 3 target). MTE2 and MTE3 are independent pipes.
+        // SetFlag<V_MTE2>/WaitFlag pair; outT WAR is now handled by the MTE3_V event above.
+        // MTE2 and MTE3 are independent pipes.
+    }
+
+    // P3.A: drain leftover MTE3_V sets that no in-loop wait consumed (the last 1-2 iters
+    // posted but the loop ended). One per outSlot that actually fired at least once.
+    if (len >= 1) {
+        WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[0]);
+    }
+    if (len >= 2) {
+        WaitFlag<HardEvent::MTE3_V>(outMte3ToVEvent_[1]);
     }
 }
 
