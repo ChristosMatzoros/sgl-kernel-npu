@@ -309,15 +309,19 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
 
         // P2.B: wait for prev iter's MTE2 prefetch of slotCurr (RAW). Iter 0 has
         // no prior set — InitRing's PIPE_ALL drains MTE2 before RunSeq starts.
+        // P2.C: also wait for prev iter's V Cast (j=0, tap=3) to be done reading
+        // slotPref(t), the slot this iter's MTE2 prefetch is about to overwrite.
+        // slotHist(t-1, 3) == slotPref(t) always (both = (t-4)%5 == (t+1)%5 mod 5).
         if (t > 0) {
             WaitFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_);
+            WaitFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
         }
 
         // ── Prefetch next input token while we compute this one ──────────
         if (t + 1 < len) {
             // Load xGm[start + t + 1] into the slot RunSeq will consume at iter t+1.
             const int64_t xOffset = static_cast<int64_t>(start + t + 1) * dim + c0; // GM byte offset of next token, this dim block
-            PipeBarrier<PIPE_ALL>();                                      // fence prior iter's V Cast that read this slot (loop-carried WAR on `ring`) — P2.C target
+            // P2.C: dropped L314/L320 pre-prefetch PIPE_ALL — V→MTE2 WAR is now covered by the WaitFlag<V_MTE2> above.
             DataCopy(ring[slotPref * MAX_BLOCK_DIM], xGm[xOffset], dimTileSize); // MTE2: GM → UB slot[slotPref]
             // P2.B: signal MTE2 prefetch complete — next iter's WaitFlag<MTE2_V> pops this.
             SetFlag<HardEvent::MTE2_V>(inputMte2ToVEvent_);
@@ -330,12 +334,21 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
         // ── Width-4 multiply-add: accF += weightF[j] * cast(ring[tap]) for each tap ──
         // Tap order is reversed (j=0 → oldest tap = (t-3), j=W-1 → current token = t).
         // P2.B: dropped per-tap PIPE_ALL (L328) — single WaitFlag<MTE2_V> at iter entry
-        // covers MTE2→V sync for slotCurr; history slots (taps 1..3) were prefetched
-        // many iters ago, drained by L314's PIPE_ALL or by InitRing for the first 4 iters.
+        // covers MTE2→V sync for slotCurr (the slot prefetched at iter t-1). History
+        // slots (taps 1..3) were prefetched many iters ago; since MTE2 is FIFO, waiting
+        // on iter t-1's prefetch transitively drains every earlier MTE2 op on the ring.
+        // For the very first iters before the prefetch queue is primed, InitRing's
+        // pre-RunSeq PIPE_ALL drain handles visibility instead.
         for (int32_t j = 0; j < MAX_WIDTH; ++j) {
             const int32_t tap  = (MAX_WIDTH - 1) - j;                    // tap index counting back from t (3,2,1,0)
             const int32_t slot = (tap == 0) ? slotCurr : SlotHist(t, tap); // which ring slot this tap lives in
             Cast(tmpF, ring[slot * MAX_BLOCK_DIM], RoundMode::CAST_NONE, dimTileSize); // V: T → FP32 into tmpF
+            // P2.C: after j=0 (tap=3 = slotPref(t+1)) Cast, signal that V is done
+            // reading the slot next iter's MTE2 prefetch will overwrite. Place the
+            // SetFlag as early as possible to maximize MTE2/V overlap.
+            if (j == 0 && t + 1 < len) {
+                SetFlag<HardEvent::V_MTE2>(tempVToMte2Event_);
+            }
             MulAddDst(accF, tmpF, weightF[j * MAX_BLOCK_DIM], dimTileSize);          // V: accF += tmpF * weightF[j]  (in-place accumulate)
         }
 
@@ -369,7 +382,9 @@ __aicore__ inline void CausalConv1d<T>::RunSeq(int32_t start, int32_t len, int32
         const int64_t outOffset = static_cast<int64_t>(start + t) * dim + c0; // GM byte offset for yGm[start+t]
         // P2.A: dropped pre-yGm PIPE_ALL — the L360 barrier above already drained V→MTE3.
         DataCopy(yGm[outOffset], outT[outSlot * MAX_BLOCK_DIM], dimTileSize);  // MTE3: UB outT slot → GM yGm
-        PipeBarrier<PIPE_ALL>();                                          // fence before next iter's prefetch overwrites a ring slot (loop-carried sync) — P2.C target
+        // P2.C: dropped L366/L372 post-yGm PIPE_ALL — V→MTE2 WAR on ring is now covered by
+        // SetFlag<V_MTE2>/WaitFlag pair; MTE3 store of outT[outSlot] is serialized at the
+        // next iter's L360 PIPE_ALL (Phase 3 target). MTE2 and MTE3 are independent pipes.
     }
 }
 
