@@ -265,7 +265,7 @@ __aicore__ inline void CausalConv1d<T>::InitRing(int32_t cacheIdx, bool hasInit,
         // Load the first input token (xGm[start]) into the ring slot that RunSeq will
         // read at t=0. SlotCurr(0) maps token t=0 to its rotating-ring slot.
         const int64_t xOffset = static_cast<int64_t>(start) * dim + c0;            // GM byte offset of xGm[start]
-        PipeBarrier<PIPE_ALL>();                                                   // fence prior history fill so MTE2 doesn't race with V Duplicate
+        // P4.A: dropped pre-prefetch PIPE_ALL — L262 above already drained all pipes.
         DataCopy(ring[SlotCurr(0) * MAX_BLOCK_DIM], xGm[xOffset], dimTileSize);    // MTE2: GM → UB slot[SlotCurr(0)]
         PipeBarrier<PIPE_ALL>();                                                   // fence so RunSeq's first Cast sees the prefetched slot
     }
@@ -421,6 +421,12 @@ __aicore__ inline void CausalConv1d<T>::WriteBackState(int32_t cacheIdx, int32_t
                                                       // are what the next call must resume from.
     LocalTensor<T> ring = inBuf.Get<T>();             // re-view the ring (RunSeq left it populated, no need to reload)
 
+    // P4.A: hoist the pre-MTE3 PIPE_ALL out of the loop — it's only needed ONCE per
+    // WriteBackState call (cross-pipe MTE2→MTE3 RAW on `ring`: RunSeq's last MTE2
+    // prefetch wrote ring slots; MTE3 here reads them). End-of-RunSeq drains only
+    // sync V↔MTE3, not MTE2→MTE3, so this barrier is load-bearing. Subsequent iters
+    // are MTE3-FIFO-ordered. Net: 3 iters × 2 barriers = 6 PIPE_ALL → 1 PIPE_ALL.
+    PipeBarrier<PIPE_ALL>();                                                          // cross-pipe MTE2→MTE3 sync for ring (once)
     // Walk pos = 0..W-2 and persist the corresponding ring slot back to convStatesGm.
     // tap = (W-2) - pos maps "newest first" so pos=0 stores the most-recent history slot.
     for (int32_t pos = 0; pos < (MAX_WIDTH - 1); ++pos) {
@@ -428,9 +434,7 @@ __aicore__ inline void CausalConv1d<T>::WriteBackState(int32_t cacheIdx, int32_t
         const int32_t slot = (tap == 0) ? SlotCurr(lastT) : SlotHist(lastT, tap);     // which ring slot the tap currently lives in
         const int64_t stateOffset =                                                   // GM byte offset: [cacheIdx, pos, c0:c0+dimTileSize]
             static_cast<int64_t>(cacheIdx) * stateLen * dim + static_cast<int64_t>(pos) * dim + c0;
-        PipeBarrier<PIPE_ALL>();                                                       // gate so MTE3 sees the final ring contents from RunSeq
         DataCopy(convStatesGm[stateOffset], ring[slot * MAX_BLOCK_DIM], dimTileSize); // MTE3: UB ring slot → GM convStates row
-        PipeBarrier<PIPE_ALL>();                                                       // gate so next iter's MTE3 doesn't race with this one (FIFO-redundant in practice)
     }
 }
 
