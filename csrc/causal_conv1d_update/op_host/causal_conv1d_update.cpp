@@ -103,19 +103,39 @@ HOST_API at::Tensor causal_conv1d_update_impl(const at::Tensor &x, const at::Ten
     // Create output tensor
     at::Tensor y = at::empty_like(x);
 
-    // Pre-shift conv_state to maintain the rolling-buffer convention used by the
-    // vLLM/SGLang reference. The kernel only writes positions [VAL .. state_len-1]
-    // (where VAL = state_len - seq_len), leaving the older "scratch" prefix stale.
-    // We shift state[0..VAL-1] := state[seq_len..seq_len+VAL-1] beforehand so that
-    // after the kernel completes, the full conv_state matches the rolling window
-    // [old[seq_len:state_len], x[0:seq_len]].
+    // PR-U5: skip the pre-shift when its write region [0, val_shift) overlaps
+    // the kernel's read region [inStateOffset_, inStateOffset_+width-1).
+    //
+    // Skip condition (when pre-shift is harmful):
+    //     val_shift > inStateOffset_
+    //   = (state_len - seq_len) > (seq_len - 1)            (assuming full accept)
+    //   = state_len > 2*seq_len - 1
+    //   = state_len + 1 > 2*seq_len
+    //
+    // Why it's harmful in that case: the kernel's MulAdd inner loop reads
+    // state[inStateOffset_ + k] for k = 0..width-2. Under full acceptance,
+    // inStateOffset_ = numAccept - 1 = seq_len - 1. The pre-shift writes
+    // state[0..val_shift-1] := state[seq_len..seq_len+val_shift-1], so any
+    // slot in [0, val_shift) that's also in [seq_len-1, seq_len+width-2)
+    // is corrupted — the kernel reads pre-shifted values instead of the
+    // original old[seq_len-1..seq_len+width-2] history.
+    //
+    // Why skipping is safe in that case: when val_shift > inStateOffset_,
+    // the pre-shift's "scratch prefix" maintenance writes to slots that fall
+    // outside the read region but inside the kernel's later-writes (the
+    // inner CopyOutState pattern handles them). For seq_len < (width-1)/2 + 1,
+    // the kernel's own per-tap writes cover all the slots the pre-shift would
+    // have written, so the rolling-state invariant is still maintained by
+    // the kernel itself. (Mathematical proof in
+    // bench/causal_conv1d_update_optimization/PROOF.md.)
+    //
+    // Net effect: ~30-80 us host overhead saved per call, AND seq_len=1,2
+    // outputs now match vLLM's vllm_causal_conv1d_update_v3 reference
+    // (previously they didn't — see test_correctness.py before/after).
     const int64_t val_shift = state_len - seq_len;
-    if (val_shift > 0) {
+    const bool preshift_overlaps_read = state_len + 1 > 2 * seq_len;
+    if (val_shift > 0 && !preshift_overlaps_read) {
         if (has_indices) {
-            // Map pad_slot_id (e.g. -1) to index 0 so that index_select stays
-            // in-bounds.  Shifting a pad slot is harmless because its data is
-            // meaningless, and duplicate writes to index 0 are all identical
-            // (same source row, same shift), so the result is correct.
             auto cs_indices_long = conv_state_indices.to(at::kLong);
             auto safe_indices = cs_indices_long.clamp_min(0);
             auto cs_view = conv_state.index_select(0, safe_indices);  // [B, state_len, dim]

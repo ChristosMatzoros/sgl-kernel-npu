@@ -40,6 +40,7 @@ private:
     TBuf<QuePosition::VECCALC> inputBuf_;
     TBuf<QuePosition::VECCALC> castBufInput_;
     TBuf<QuePosition::VECCALC> castBufWeight_;
+    TBuf<QuePosition::VECCALC> castBufBias_;   // PR-U2: cached FP32 bias
     TBuf<QuePosition::VECCALC> resultBuf_;
 
     GlobalTensor<T> xGm_;
@@ -135,7 +136,14 @@ __aicore__ inline void CausalConv1dUpdate<T>::Init(GM_ADDR x, GM_ADDR weight, GM
     // alloc TBuf
     pipe_.InitBuffer(inputBuf_, tilingData_.dim * sizeof(T));
     pipe_.InitBuffer(castBufInput_, tilingData_.dim * sizeof(float));
-    pipe_.InitBuffer(castBufWeight_, tilingData_.dim * sizeof(float));
+    // PR-U1 (cast-cache): hold the full FP32 weight (all width rows) so the
+    // inner k-loop just indexes into it instead of re-casting wLocal[k*dim]
+    // on every tap iter, and (for spec/MTP) also across every j iter.
+    pipe_.InitBuffer(castBufWeight_, tilingData_.width * tilingData_.dim * sizeof(float));
+    // PR-U2: cached FP32 bias — populated once before the i/j-loops when has_bias.
+    if (tilingData_.hasBias) {
+        pipe_.InitBuffer(castBufBias_, tilingData_.dim * sizeof(float));
+    }
     pipe_.InitBuffer(resultBuf_, tilingData_.dim * sizeof(float));
 }
 
@@ -165,6 +173,24 @@ __aicore__ inline void CausalConv1dUpdate<T>::ComputeUpdate(int64_t xOffset)
     resultLocal = resultBuf_.Get<float>();
     castIn = castBufInput_.Get<float>();
     castWeight = castBufWeight_.Get<float>();
+    // PR-U1: cast ALL weight rows to FP32 once, here, before the i/j-loops. The
+    // inner k-loop now just indexes castWeight[k*dim:(k+1)*dim] directly — saves
+    // (width * calcSeqLen - width) Cast ops across the lifetime of one call.
+    Cast(castWeight, wLocal, RoundMode::CAST_NONE, tilingData_.width * tilingData_.dim);
+    PipeBarrier<PIPE_V>();
+
+    // PR-U2: load + cast bias once before the j-loops. Bias is invariant; the
+    // per-j-iter CopyInBias + DeQue + Cast that S0 does was pure waste.
+    LocalTensor<float> castBias;
+    if (tilingData_.hasBias) {
+        CopyInBias(tilingData_.dim, 0);
+        LocalTensor<T> biasLocal = inQueueBias_.DeQue<T>();
+        castBias = castBufBias_.Get<float>();
+        Cast(castBias, biasLocal, RoundMode::CAST_NONE, tilingData_.dim);
+        inQueueBias_.FreeTensor(biasLocal);
+        PipeBarrier<PIPE_V>();
+    }
+
     int64_t stateOffset = 0;
 
     if (!tilingData_.hasIndices) {
@@ -213,8 +239,8 @@ __aicore__ inline void CausalConv1dUpdate<T>::ComputeUpdate(int64_t xOffset)
 
                 MTE2ToVSync();
                 Cast(castIn, inLocal, RoundMode::CAST_NONE, tilingData_.dim);
-                Cast(castWeight, wLocal[k * tilingData_.dim], RoundMode::CAST_NONE, tilingData_.dim);
-                MulAddDst(resultLocal, castIn, castWeight, tilingData_.dim);
+                // PR-U1: weight already cast to FP32 in castWeight[k*dim:(k+1)*dim].
+                MulAddDst(resultLocal, castIn, castWeight[k * tilingData_.dim], tilingData_.dim);
 
                 VToMTE2Sync();
             }
@@ -226,22 +252,23 @@ __aicore__ inline void CausalConv1dUpdate<T>::ComputeUpdate(int64_t xOffset)
 
             MTE2ToVSync();
             Cast(castIn, inLocal, RoundMode::CAST_NONE, tilingData_.dim);
-            Cast(castWeight, wLocal[(tilingData_.width - 1) * tilingData_.dim], RoundMode::CAST_NONE, tilingData_.dim);
-            MulAddDst(resultLocal, castIn, castWeight, tilingData_.dim);
+            // PR-U1: weight already cast; index the last-tap slice.
+            MulAddDst(resultLocal, castIn, castWeight[(tilingData_.width - 1) * tilingData_.dim], tilingData_.dim);
 
             if (tilingData_.hasBias) {
-                CopyInBias(tilingData_.dim, 0);
-                LocalTensor<T> biasLocal = inQueueBias_.DeQue<T>();
-                Cast(castIn, biasLocal, RoundMode::CAST_NONE, tilingData_.dim);
-                Add(resultLocal, castIn, resultLocal, tilingData_.dim);
-                inQueueBias_.FreeTensor(biasLocal);
+                // PR-U2: bias already cast to FP32 in castBias before the loops.
+                Add(resultLocal, castBias, resultLocal, tilingData_.dim);
             }
 
             if (tilingData_.activationMode) {
-                Muls(castWeight, resultLocal, (float)-1.0, tilingData_.dim);
-                Exp(castWeight, castWeight, tilingData_.dim);
-                Adds(castWeight, castWeight, (float)1.0, tilingData_.dim);
-                Div(resultLocal, resultLocal, castWeight, tilingData_.dim);
+                // Revert of PR-U3 — AscendC Silu intrinsic produced wildly wrong
+                // output (~12 absolute diff vs vLLM ref). Stick with the explicit
+                // x / (1 + exp(-x)) decomposition; use castIn as scratch so the
+                // cached castWeight (PR-U1) survives across j-iters.
+                Muls(castIn, resultLocal, (float)-1.0, tilingData_.dim);
+                Exp(castIn, castIn, tilingData_.dim);
+                Adds(castIn, castIn, (float)1.0, tilingData_.dim);
+                Div(resultLocal, resultLocal, castIn, tilingData_.dim);
             }
 
             Cast(outLocal, resultLocal, RoundMode::CAST_ROUND, tilingData_.dim);
@@ -258,8 +285,8 @@ __aicore__ inline void CausalConv1dUpdate<T>::ComputeUpdate(int64_t xOffset)
 
                 MTE2ToVSync();
                 Cast(castIn, inLocal, RoundMode::CAST_NONE, tilingData_.dim);
-                Cast(castWeight, wLocal[k * tilingData_.dim], RoundMode::CAST_NONE, tilingData_.dim);
-                MulAddDst(resultLocal, castIn, castWeight, tilingData_.dim);
+                // PR-U1: weight already cast — index it directly.
+                MulAddDst(resultLocal, castIn, castWeight[k * tilingData_.dim], tilingData_.dim);
 
                 VToMTE2Sync();
             }
@@ -271,22 +298,17 @@ __aicore__ inline void CausalConv1dUpdate<T>::ComputeUpdate(int64_t xOffset)
 
             MTE2ToVSync();
             Cast(castIn, inLocal, RoundMode::CAST_NONE, tilingData_.dim);
-            Cast(castWeight, wLocal[(tilingData_.width - 1) * tilingData_.dim], RoundMode::CAST_NONE, tilingData_.dim);
-            MulAddDst(resultLocal, castIn, castWeight, tilingData_.dim);
+            // PR-U1: weight already cast; index last-tap slice.
+            MulAddDst(resultLocal, castIn, castWeight[(tilingData_.width - 1) * tilingData_.dim], tilingData_.dim);
 
             if (tilingData_.hasBias) {
-                CopyInBias(tilingData_.dim, 0);
-                LocalTensor<T> biasLocal = inQueueBias_.DeQue<T>();
-                Cast(castIn, biasLocal, RoundMode::CAST_NONE, tilingData_.dim);
-                Add(resultLocal, castIn, resultLocal, tilingData_.dim);
-                inQueueBias_.FreeTensor(biasLocal);
+                // PR-U2: bias cached in FP32.
+                Add(resultLocal, castBias, resultLocal, tilingData_.dim);
             }
 
             if (tilingData_.activationMode) {
-                Muls(castWeight, resultLocal, (float)-1.0, tilingData_.dim);
-                Exp(castWeight, castWeight, tilingData_.dim);
-                Adds(castWeight, castWeight, (float)1.0, tilingData_.dim);
-                Div(resultLocal, resultLocal, castWeight, tilingData_.dim);
+                // PR-U3: fused Silu (1 V op vs 4).
+                Silu(resultLocal, resultLocal, tilingData_.dim);
             }
 
             Cast(outLocal, resultLocal, RoundMode::CAST_ROUND, tilingData_.dim);
