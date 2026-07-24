@@ -20,6 +20,9 @@
 // mega_kernel's cu_seqlens). NOTE codegen needs "type* name", not "type *name".
 
 #include <pto/pto-inst.hpp>
+#if defined(__NPU_ARCH__)  // device compile pass only; PTO arch-aware buffer sizes
+#include <pto/common/buffer_limits.hpp>
+#endif
 
 // A5 (dav-c310) has no PIPE_V barrier in the VF/RegBase model; make the
 // in-core vector barrier a no-op there and the real barrier on A2A3.
@@ -45,9 +48,13 @@ namespace cc1d {
 // RS (compile-time, power of two) sizes the accumulator ring and the entire UB
 // layout; K (runtime, <= RS) only drives loop bounds, so one RS variant serves
 // every width with roundUpToPow2(width) == RS. MAX_W is the compile-time per-RS
-// channel-tile capacity. Ascend 910B2 AIV UB = 192 KiB; the static_assert in
-// convChunk checks the chosen (RS, MAX_W) layout fits.
-constexpr uint32_t UB_BYTES_PER_CORE = 192u * 1024u;
+// channel-tile capacity. UB is arch-sized by PTO (A2/A3 = 192 KiB, A5/dav-c310
+// = 256 KiB); the static_assert in convChunk checks the chosen (RS, MAX_W) fits.
+#if defined(PTO_UBUF_SIZE_BYTES)
+constexpr uint32_t UB_BYTES_PER_CORE = PTO_UBUF_SIZE_BYTES;
+#else
+constexpr uint32_t UB_BYTES_PER_CORE = 192u * 1024u;  // host-only launch-harness pass (UB unused there)
+#endif
 
 template <typename TileT>
 AICORE inline void applySiluToTile(TileT &dst, TileT &src, TileT &tmp)
