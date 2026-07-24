@@ -482,8 +482,14 @@ AICORE void runWriteback(__gm__ IoElemType *x, __gm__ IoElemType *convStates, __
 
 // Ring sizes the kernel is compiled for -- must match FOR_EACH_RING_SIZE in
 // op_host/causal_conv1d.cpp. Each row is (ringSize, maxTileWidth); a larger ring uses
-// a smaller tile to fit the 192 KiB UB.
+// a smaller tile. A5 (dav-c310) has 256 KiB UB vs A2/A3's 192 KiB, so its tiles are
+// ~4/3 wider -> fewer channel-tiles for large dim (e.g. dim=4096,K=4: 1 tile not 2).
+// Both variants are checked against PTO_UBUF_SIZE_BYTES by the convChunk static_assert.
+#if defined(PTO_NPU_ARCH_A5)
+#define FOR_EACH_RING_SIZE(DO) DO(2, 5120) DO(4, 4096) DO(8, 2048) DO(16, 1152) DO(32, 512) DO(64, 128)
+#else
 #define FOR_EACH_RING_SIZE(DO) DO(2, 4096) DO(4, 3072) DO(8, 1536) DO(16, 896) DO(32, 384) DO(64, 128)
+#endif
 #define DEFINE_ENTRIES(ringSize, maxTileWidth)                        \
     DEF_CONV(rs##ringSize##_half, half, ringSize, maxTileWidth)       \
     DEF_CONV(rs##ringSize##_bf16, bfloat16_t, ringSize, maxTileWidth) \
