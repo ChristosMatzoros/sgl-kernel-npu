@@ -214,32 +214,30 @@ AICORE inline void convChunk(__gm__ IoElemType *x, __gm__ IoElemType *y, __gm__ 
 
         PIPE_BARRIER_VEC();
 
+        // Scatter with a native fused multiply-add: tap k == 0 BORNs the accumulator
+        // (plain TMUL, overwrite) and every later tap folds straight into it with a
+        // single TMULADDDST. Per input row that is 1 TCVT + 1 TMUL + (K-1) TMULADDDST
+        // instead of 1 TCVT + K TMUL + (K-1) TADD; the RS-1 temp tiles and the barrier
+        // that separated the multiply phase from the accumulate phase both disappear.
+        // Each k targets a DIFFERENT accumulator (out = j + halo - k), so the K ops are
+        // mutually independent and need no ordering between them.
+        //
+        // TMULADDDST needs an up-to-date pto-isa: it is absent both from the PTO bundled
+        // with CANN 9.0.0 and from older third_party/pto-isa pins, which expose only
+        // TMUL/TADD. Build with the submodule checked out at the pinned revision:
+        //     git submodule update --init third_party/pto-isa
         const bool startAll = zeroPad && (j == 0);
         for (uint32_t k = 0; k < K; ++k) {
             const int32_t out = j + halo - (int32_t)k;
             if (out < l0 || out >= l1) continue;
             AccumTile wT(lanes);
+            AccumTile acc(lanes);
             TASSIGN(wT, k * accumTileBytes);
+            TASSIGN(acc, ubAccumRingBase + (out & (RS - 1u)) * accumTileBytes);
             if (startAll || k == 0) {
-                AccumTile acc(lanes);
-                TASSIGN(acc, ubAccumRingBase + (out & (RS - 1u)) * accumTileBytes);
                 TMUL(acc, xin_f, wT);
             } else {
-                AccumTile t(lanes);
-                TASSIGN(t, ubProductBase + (k - 1u) * accumTileBytes);
-                TMUL(t, xin_f, wT);
-            }
-        }
-        PIPE_BARRIER_VEC();
-        if (!startAll) {
-            for (uint32_t k = 1; k < K; ++k) {
-                const int32_t out = j + halo - (int32_t)k;
-                if (out < l0 || out >= l1) continue;
-                AccumTile acc(lanes);
-                AccumTile t(lanes);
-                TASSIGN(acc, ubAccumRingBase + (out & (RS - 1u)) * accumTileBytes);
-                TASSIGN(t, ubProductBase + (k - 1u) * accumTileBytes);
-                TADD(acc, acc, t);
+                TMULADDDST(acc, xin_f, wT);
             }
         }
         PIPE_BARRIER_VEC();
