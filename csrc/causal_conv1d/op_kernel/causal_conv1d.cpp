@@ -113,10 +113,12 @@ AICORE inline void convChunk(__gm__ IoElemType *x, __gm__ IoElemType *y, __gm__ 
     static_assert((RS + 1u) * ioTileBytes <= 2u * RS * accumTileBytes,
                   "conv1d: native weight/bias staging does not fit the scratch region");
     // The PREVIOUS task's output phase reads this same region with V (TCVT(outT, acc));
-    // drain V before our staging MTE2 overwrites it -- otherwise a cross-task WAR
-    // corrupts that task's output. Self-contained on ID0 (clean here; reused by the loop).
-    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
-    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID0);
+    // Staging guard and weight barrier use dedicated event ids (ID4/ID5). They used to
+    // reuse ID0/ID3, which also serve as input slots 0/1 -- that coupling forced the
+    // first x TLOAD to wait for the weight TCVTs to retire. See the block move below.
+    // The PREVIOUS task's output phase reads this region with V (TCVT(outT, acc)); drain
+    set_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);   // V before our staging MTE2 (cross-task WAR)
+    wait_flag(PIPE_V, PIPE_MTE2, EVENT_ID4);
     for (uint32_t k = 0; k < K; ++k) {
         GlobalIoTensor wG(wgt + (uint64_t)k * dim + c0, {lanes});
         IoTile wStage(lanes);
@@ -129,27 +131,11 @@ AICORE inline void convChunk(__gm__ IoElemType *x, __gm__ IoElemType *y, __gm__ 
         TASSIGN(bStage, ubStageBase + K * ioTileBytes);
         TLOAD(bStage, bG);
     }
-    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);
-    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID3);  // all native tiles staged before any cast
-    for (uint32_t k = 0; k < K; ++k) {
-        IoTile wStage(lanes);
-        AccumTile wT(lanes);
-        TASSIGN(wStage, ubStageBase + k * ioTileBytes);
-        TASSIGN(wT, k * accumTileBytes);
-        TCVT(wT, wStage, pto::RoundMode::CAST_NONE);
-    }
-    if (hasBias) {
-        IoTile bStage(lanes);
-        AccumTile bT(lanes);
-        TASSIGN(bStage, ubStageBase + K * ioTileBytes);
-        TASSIGN(bT, ubBiasOffset);
-        TCVT(bT, bStage, pto::RoundMode::CAST_NONE);
-    }
-    // The cast TCVTs (V) finish before the input loop's first TMUL/TCVT (also V, in
-    // program order) reuses this scratch region -- no extra sync needed.
-
-    // double-buffered input: two load slots with independent handshakes.
-    // EVENT_ID3 is reused here (the weight/bias load above already consumed it).
+    set_flag(PIPE_MTE2, PIPE_V, EVENT_ID5);
+    // Double-buffered input: two load slots with independent handshakes. These slot
+    // set_flags and the prologue TLOAD are issued BEFORE V blocks on the weight
+    // barrier (EVENT_ID5), so MTE2 can fetch the first x row while the weight TCVTs
+    // are still pending instead of after them.
     const event_t IEV[2] = {EVENT_ID0, EVENT_ID3};
     set_flag(PIPE_V, PIPE_MTE2, IEV[0]);  // xin_h[0] initially free
     set_flag(PIPE_V, PIPE_MTE2, IEV[1]);  // xin_h[1] initially free
@@ -181,6 +167,25 @@ AICORE inline void convChunk(__gm__ IoElemType *x, __gm__ IoElemType *y, __gm__ 
         }
         set_flag(PIPE_MTE2, PIPE_V, IEV[0]);
     }
+    // All native weight/bias tiles are staged; only now block V on them.
+    wait_flag(PIPE_MTE2, PIPE_V, EVENT_ID5);
+    for (uint32_t k = 0; k < K; ++k) {
+        IoTile wStage(lanes);
+        AccumTile wT(lanes);
+        TASSIGN(wStage, ubStageBase + k * ioTileBytes);
+        TASSIGN(wT, k * accumTileBytes);
+        TCVT(wT, wStage, pto::RoundMode::CAST_NONE);
+    }
+    if (hasBias) {
+        IoTile bStage(lanes);
+        AccumTile bT(lanes);
+        TASSIGN(bStage, ubStageBase + K * ioTileBytes);
+        TASSIGN(bT, ubBiasOffset);
+        TCVT(bT, bStage, pto::RoundMode::CAST_NONE);
+    }
+    // The cast TCVTs (V) finish before the input loop's first TMUL/TCVT (also V, in
+    // program order) reuses this scratch region -- no extra sync needed.
+
 
     for (int32_t j = jstart; j < l1; ++j) {
         const uint32_t par = (j - jstart) & 1u;
